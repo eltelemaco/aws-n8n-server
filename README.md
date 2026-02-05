@@ -50,9 +50,9 @@ This repository provisions a complete n8n workflow automation platform on a sing
 
 | Service | URL | Description |
 |---------|-----|-------------|
-| n8n | `https://n8n.telemaco.com.mx/n8n` | Workflow automation UI |
-| Portainer | `https://n8n.telemaco.com.mx/portainer` | Container management UI |
-| Webhooks | `https://n8n.telemaco.com.mx/n8n/webhook/*` | n8n webhook endpoints (no auth) |
+| n8n | `https://domain.com/n8n` | Workflow automation UI |
+| Portainer | `https://domain.com/portainer` | Container management UI |
+| Webhooks | `https://domain.com/n8n/webhook/*` | n8n webhook endpoints (no auth) |
 
 ### Secrets Flow
 
@@ -92,7 +92,7 @@ Secrets are **never** committed to the repository or embedded in user_data.
    - [Install Terraform](https://developer.hashicorp.com/terraform/downloads)
 
 4. **Domain Name** with DNS management access
-   - Default: `n8n.telemaco.com.mx`
+   - Default: `domain.com`
    - You'll need to create an A record pointing to the Elastic IP
 
 5. **SSH Key Pair** (one of):
@@ -143,7 +143,7 @@ tfc_workspace_name     = "n8n-workspace-east1"
 aws_region             = "us-east-1"
 admin_ssh_cidr         = "YOUR_IP/32"
 public_key_material    = "ssh-ed25519 AAAA... your-key"
-domain_name            = "n8n.telemaco.com.mx"
+domain_name            = "domain.com"
 letsencrypt_email      = "admin@example.com"
 ssm_path_prefix        = "/n8n/prod"
 
@@ -188,15 +188,15 @@ terraform output public_ip
 Create an **A record** in your DNS provider:
 
 ```text
-n8n.telemaco.com.mx  →  <ELASTIC_IP>
+domain.com  →  <ELASTIC_IP>
 ```
 
 ### Step 6: Verify Deployment
 
 Wait 3-5 minutes for the EC2 instance to boot and start all services.
 
-1. **Check n8n**: `https://n8n.telemaco.com.mx/n8n`
-2. **Check Portainer**: `https://n8n.telemaco.com.mx/portainer`
+1. **Check n8n**: `https://domain.com/n8n`
+2. **Check Portainer**: `https://domain.com/portainer`
 
 You'll be prompted for basic auth credentials (the ones you configured).
 
@@ -223,7 +223,7 @@ You'll be prompted for basic auth credentials (the ones you configured).
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `aws_region` | `us-east-1` | AWS region |
-| `domain_name` | `n8n.telemaco.com.mx` | Domain for services |
+| `domain_name` | `domain.com` | Domain for services |
 | `acme_ca_server` | Let's Encrypt Staging | ACME server URL |
 | `instance_type` | `t2.micro` | EC2 instance type |
 | `root_volume_size` | `30` | Root volume size (GB) |
@@ -336,7 +336,7 @@ By default, Let's Encrypt **staging** certificates are used. Once you've verifie
    docker compose up -d traefik
    ```
 
-4. **Verify** by visiting `https://n8n.telemaco.com.mx/n8n` - you should see a valid certificate.
+4. **Verify** by visiting `https://domain.com/n8n` - you should see a valid certificate.
 
 ### Backup and Restore
 
@@ -436,7 +436,7 @@ docker compose start n8n n8n-worker
 1. **Verify DNS is pointing to the Elastic IP**:
 
    ```bash
-   dig n8n.telemaco.com.mx +short
+   dig domain.com +short
    ```
 
 2. **Check Traefik logs**:
@@ -465,7 +465,7 @@ docker compose start n8n n8n-worker
 3. **Test webhook endpoint**:
 
    ```bash
-   curl -I https://n8n.telemaco.com.mx/n8n/webhook/test
+   curl -I https://domain.com/n8n/webhook/test
    # Should return 404 or 200, NOT 401 Unauthorized
    ```
 
