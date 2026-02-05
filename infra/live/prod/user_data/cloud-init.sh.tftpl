@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+AWS_REGION="${aws_region}"
+SSM_PATH_PREFIX="${ssm_path_prefix}"
+STACK_DIR="${stack_dir}"
+PUBLIC_KEY="${public_key_material}"
+
+dnf update -y
+dnf install -y docker jq httpd-tools amazon-ssm-agent
+
+# Ensure SSM agent is running (for Parameter Store access)
+systemctl enable amazon-ssm-agent
+systemctl start amazon-ssm-agent
+
+# Install Docker Compose plugin (not in default AL2023 repos)
+DOCKER_COMPOSE_VERSION="v2.29.2"
+mkdir -p /usr/local/lib/docker/cli-plugins
+curl -SL "https://github.com/docker/compose/releases/download/$${DOCKER_COMPOSE_VERSION}/docker-compose-linux-x86_64" \
+	-o /usr/local/lib/docker/cli-plugins/docker-compose
+chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
+
+systemctl enable docker
+systemctl start docker
+
+cat > /etc/docker/daemon.json <<'EOF'
+{
+	"log-driver": "json-file",
+	"log-opts": {
+		"max-size": "10m",
+		"max-file": "3"
+	}
+}
+EOF
+
+systemctl restart docker
+
+# Create telemaco user with sudo privileges and SSH access
+useradd -m -s /bin/bash telemaco
+usermod -aG wheel telemaco
+usermod -aG docker telemaco
+
+# Enable passwordless sudo for telemaco
+echo "telemaco ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/telemaco
+chmod 440 /etc/sudoers.d/telemaco
+
+mkdir -p /home/telemaco/.ssh
+chmod 700 /home/telemaco/.ssh
+echo "$${PUBLIC_KEY}" > /home/telemaco/.ssh/authorized_keys
+chmod 600 /home/telemaco/.ssh/authorized_keys
+chown -R telemaco:telemaco /home/telemaco/.ssh
+
+mkdir -p "$${STACK_DIR}/traefik" "$${STACK_DIR}/secrets"
+touch "$${STACK_DIR}/traefik/acme.json"
+chmod 600 "$${STACK_DIR}/traefik/acme.json"
+
+get_param() {
+	aws ssm get-parameter \
+		--name "$${SSM_PATH_PREFIX}/$1" \
+		--with-decryption \
+		--region "$${AWS_REGION}" \
+		--query "Parameter.Value" \
+		--output text
+}
+
+DOMAIN_NAME="$(get_param domain_name)"
+LETSENCRYPT_EMAIL="$(get_param letsencrypt_email)"
+ACME_CA_SERVER="$(get_param acme_ca_server)"
+POSTGRES_PASSWORD="$(get_param postgres_password)"
+N8N_ENCRYPTION_KEY="$(get_param n8n_encryption_key)"
+BASIC_AUTH_USERNAME="$(get_param basic_auth_username)"
+BASIC_AUTH_PASSWORD="$(get_param basic_auth_password)"
+PORTAINER_ADMIN_PASSWORD="$(get_param portainer_admin_password)"
+
+# Escape $ characters in bcrypt hash for Docker Compose
+PORTAINER_ADMIN_PASSWORD_HASH="$(htpasswd -nbB admin "$${PORTAINER_ADMIN_PASSWORD}" | cut -d':' -f2 | sed 's/\$/\$\$/g')"
+
+cat > "$${STACK_DIR}/.env" <<EOF
+DOMAIN_NAME=$${DOMAIN_NAME}
+LETSENCRYPT_EMAIL=$${LETSENCRYPT_EMAIL}
+ACME_CA_SERVER=$${ACME_CA_SERVER}
+
+POSTGRES_DB=n8n
+POSTGRES_USER=n8n
+POSTGRES_PASSWORD=$${POSTGRES_PASSWORD}
+
+DB_TYPE=postgresdb
+DB_POSTGRESDB_HOST=postgres
+DB_POSTGRESDB_DATABASE=n8n
+DB_POSTGRESDB_USER=n8n
+DB_POSTGRESDB_PASSWORD=$${POSTGRES_PASSWORD}
+
+EXECUTIONS_MODE=queue
+QUEUE_BULL_REDIS_HOST=redis
+
+N8N_ENCRYPTION_KEY=$${N8N_ENCRYPTION_KEY}
+N8N_HOST=$${DOMAIN_NAME}
+N8N_PROTOCOL=https
+N8N_PORT=5678
+N8N_PATH=/n8n/
+WEBHOOK_URL=https://$${DOMAIN_NAME}/n8n/
+N8N_EDITOR_BASE_URL=https://$${DOMAIN_NAME}/n8n/
+N8N_TRUST_PROXY=true
+N8N_SECURE_COOKIE=true
+
+BASIC_AUTH_USERNAME=$${BASIC_AUTH_USERNAME}
+BASIC_AUTH_PASSWORD=$${BASIC_AUTH_PASSWORD}
+
+PORTAINER_ADMIN_PASSWORD_HASH=$${PORTAINER_ADMIN_PASSWORD_HASH}
+EOF
+
+chmod 600 "$${STACK_DIR}/.env"
+
+htpasswd -nbB "$${BASIC_AUTH_USERNAME}" "$${BASIC_AUTH_PASSWORD}" > "$${STACK_DIR}/secrets/htpasswd"
+chmod 600 "$${STACK_DIR}/secrets/htpasswd"
+
+cat > "$${STACK_DIR}/docker-compose.yml" <<'EOF'
+${docker_compose}
+EOF
+
+cat > /etc/systemd/system/n8n-compose.service <<'EOF'
+${systemd_unit}
+EOF
+
+systemctl daemon-reload
+systemctl enable n8n-compose.service
+systemctl start n8n-compose.service

@@ -1,0 +1,151 @@
+services:
+  traefik:
+    image: traefik:v2.11.36
+    command:
+      - "--api.dashboard=false"
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.websecure.address=:443"
+      - "--certificatesresolvers.le.acme.email=$${LETSENCRYPT_EMAIL}"
+      - "--certificatesresolvers.le.acme.storage=/letsencrypt/acme.json"
+      - "--certificatesresolvers.le.acme.caserver=$${ACME_CA_SERVER}"
+      - "--certificatesresolvers.le.acme.httpchallenge=true"
+      - "--certificatesresolvers.le.acme.httpchallenge.entrypoint=web"
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./traefik/acme.json:/letsencrypt/acme.json
+      - ./secrets/htpasswd:/secrets/htpasswd:ro
+    restart: unless-stopped
+
+  n8n:
+    image: n8nio/n8n:2.7.1
+    env_file: .env
+    depends_on:
+      - postgres
+      - redis
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.n8n.rule=Host(`$${DOMAIN_NAME}`) && PathPrefix(`/n8n`)"
+      - "traefik.http.routers.n8n.entrypoints=websecure"
+      - "traefik.http.routers.n8n.tls.certresolver=le"
+      - "traefik.http.routers.n8n.priority=50"
+      - "traefik.http.routers.n8n.middlewares=n8n-strip@docker"
+      - "traefik.http.middlewares.n8n-strip.stripprefix.prefixes=/n8n"
+      - "traefik.http.routers.n8n-webhook.rule=Host(`$${DOMAIN_NAME}`) && (PathPrefix(`/n8n/webhook`) || PathPrefix(`/n8n/webhook-test`))"
+      - "traefik.http.routers.n8n-webhook.entrypoints=websecure"
+      - "traefik.http.routers.n8n-webhook.tls.certresolver=le"
+      - "traefik.http.routers.n8n-webhook.priority=100"
+      - "traefik.http.routers.n8n-webhook.middlewares=n8n-strip@docker"
+    volumes:
+      - n8n_data:/home/node/.n8n
+    restart: unless-stopped
+
+  tower:
+    image: eltelemaco/tower-rescue:0.1
+    labels:
+      - "traefik.enable=true"
+      # Main tower route
+      - "traefik.http.routers.tower.rule=Host(`$${DOMAIN_NAME}`) && PathPrefix(`/tower`)"
+      - "traefik.http.routers.tower.entrypoints=websecure"
+      - "traefik.http.routers.tower.tls.certresolver=le"
+      - "traefik.http.routers.tower.middlewares=tower-strip@docker"
+      - "traefik.http.middlewares.tower-strip.stripprefix.prefixes=/tower"
+      # Route for Expo assets at /_expo
+      - "traefik.http.routers.tower-expo.rule=Host(`$${DOMAIN_NAME}`) && PathPrefix(`/_expo`)"
+      - "traefik.http.routers.tower-expo.entrypoints=websecure"
+      - "traefik.http.routers.tower-expo.tls.certresolver=le"
+      - "traefik.http.routers.tower-expo.priority=100"
+      # Route for assets (fonts, images, etc.)
+      - "traefik.http.routers.tower-assets.rule=Host(`$${DOMAIN_NAME}`) && PathPrefix(`/assets`)"
+      - "traefik.http.routers.tower-assets.entrypoints=websecure"
+      - "traefik.http.routers.tower-assets.tls.certresolver=le"
+      - "traefik.http.routers.tower-assets.priority=100"
+      # Route for favicon
+      - "traefik.http.routers.tower-favicon.rule=Host(`$${DOMAIN_NAME}`) && Path(`/favicon.ico`)"
+      - "traefik.http.routers.tower-favicon.entrypoints=websecure"
+      - "traefik.http.routers.tower-favicon.tls.certresolver=le"
+      - "traefik.http.routers.tower-favicon.priority=100"
+      # Service port
+      - "traefik.http.services.tower.loadbalancer.server.port=5000"
+    restart: unless-stopped
+
+  # n8n-worker:
+  #   image: n8nio/n8n:2.7.1
+  #   command: worker
+  #   env_file: .env
+  #   depends_on:
+  #     - postgres
+  #     - redis
+  #     volumes:
+  #       - n8n_data:/home/node/.n8n
+  #   restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine3.23
+    environment:
+      - POSTGRES_USER=$${POSTGRES_USER}
+      - POSTGRES_PASSWORD=$${POSTGRES_PASSWORD}
+      - POSTGRES_DB=$${POSTGRES_DB}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  redis:
+    image: redis:7.4.7-alpine3.21
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # portainer:
+  #   image: portainer/portainer-ce:2.38.0-alpine
+  #   command: ["--admin-password", "$${PORTAINER_ADMIN_PASSWORD_HASH}", "--base-url", "/portainer/"]
+  #   volumes:
+  #     - /var/run/docker.sock:/var/run/docker.sock
+  #     - portainer_data:/data
+  #   labels:
+  #     - "traefik.enable=true"
+  #     - "traefik.http.routers.portainer.rule=Host(`$${DOMAIN_NAME}`) && PathPrefix(`/portainer`)"
+  #     - "traefik.http.routers.portainer.entrypoints=websecure"
+  #     - "traefik.http.routers.portainer.tls.certresolver=le"
+  #     - "traefik.http.routers.portainer.middlewares=n8n-auth@docker"
+  #     - "traefik.http.services.portainer.loadbalancer.server.port=9000"
+  #   restart: unless-stopped
+
+  redirect:
+    image: traefik/whoami:v1.11
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.redirect.rule=Host(`$${DOMAIN_NAME}`) && Path(`/`)"
+      - "traefik.http.routers.redirect.entrypoints=websecure"
+      - "traefik.http.routers.redirect.tls.certresolver=le"
+      - "traefik.http.routers.redirect.middlewares=redirect-n8n@docker"
+      - "traefik.http.middlewares.redirect-n8n.redirectregex.regex=^/$$"
+      - "traefik.http.middlewares.redirect-n8n.redirectregex.replacement=/n8n"
+      - "traefik.http.middlewares.redirect-n8n.redirectregex.permanent=true"
+      - "traefik.http.routers.redirect-http.rule=Host(`$${DOMAIN_NAME}`) && Path(`/`)"
+      - "traefik.http.routers.redirect-http.entrypoints=web"
+      - "traefik.http.routers.redirect-http.middlewares=redirect-https@docker"
+      - "traefik.http.middlewares.redirect-https.redirectscheme.scheme=https"
+      - "traefik.http.middlewares.redirect-https.redirectscheme.permanent=true"
+    restart: unless-stopped
+
+volumes:
+  n8n_data:
+  postgres_data:
+  redis_data:
+  # portainer_data:
