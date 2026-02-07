@@ -108,6 +108,10 @@ resource "aws_instance" "this" {
   user_data                   = var.user_data
   user_data_replace_on_change = true
 
+  lifecycle {
+    ignore_changes = [user_data]
+  }
+
   metadata_options {
     http_tokens = "required"
   }

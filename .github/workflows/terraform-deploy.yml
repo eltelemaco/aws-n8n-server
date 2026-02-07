@@ -1,0 +1,367 @@
+name: Terraform Deploy
+
+# This workflow manages Terraform infrastructure deployments for the n8n server.
+# It uses HCP Terraform (Terraform Cloud) for remote state management and
+# GitHub OIDC for secure AWS authentication without storing credentials.
+#
+# Workflow behavior:
+#   - Pull Requests: Run format check, init, validate, and plan (no apply)
+#   - Push to main: Run format check, init, validate, plan, and apply
+#
+# Required Setup:
+#   GitHub Variables (Settings > Secrets and variables > Actions > Variables):
+#     - AWS_ROLE_ARN: ARN of the IAM role for OIDC authentication
+#     - AWS_REGION: AWS region (defaults to us-east-1 if not set)
+#
+#   GitHub Secrets (Settings > Secrets and variables > Actions > Secrets):
+#     - TF_API_TOKEN: HCP Terraform API token for authentication
+#
+#   HCP Terraform:
+#     - Organization: TelemacoInfraLabs
+#     - Workspace: n8n-workspace-east1
+#     - Execution mode: Remote or Local (this workflow uses CLI-driven runs)
+
+on:
+  pull_request:
+    paths:
+      - 'infra/**'
+      - '.github/workflows/terraform-deploy.yml'
+
+  push:
+    branches:
+      - main
+    paths:
+      - 'infra/**'
+      - '.github/workflows/terraform-deploy.yml'
+
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Action to perform'
+        required: true
+        default: 'plan'
+        type: choice
+        options:
+          - plan
+          - apply
+
+# Prevent concurrent Terraform runs to avoid state conflicts
+concurrency:
+  group: terraform-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  TF_API_TOKEN: ${{ secrets.TF_API_TOKEN }}
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+  TERRAFORM_DIR: infra/live/prod
+
+jobs:
+  terraform:
+    name: Terraform
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    permissions:
+      id-token: write      # Required for OIDC authentication with AWS
+      contents: read       # Required for actions/checkout
+      pull-requests: write # Required for posting plan comments on PRs
+
+    steps:
+      # ========================================
+      # Setup
+      # ========================================
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          cli_config_credentials_token: ${{ secrets.TF_API_TOKEN }}
+
+      # ========================================
+      # Terraform Plugin Cache
+      # ========================================
+      # Caching the .terraform directory speeds up workflow execution by:
+      #   - Avoiding re-downloading provider plugins on each run
+      #   - Reducing terraform init time significantly (especially for AWS provider)
+      #   - Minimizing network calls to the Terraform registry
+      #
+      # Cache key strategy:
+      #   - Primary key: Based on OS and .terraform.lock.hcl hash
+      #   - Restore key: Falls back to any cache for the same OS if exact match not found
+      #
+      # The cache is automatically invalidated when:
+      #   - Provider versions change (lock file hash changes)
+      #   - A new provider is added to the configuration
+      - name: Cache Terraform Plugins
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.TERRAFORM_DIR }}/.terraform
+          key: terraform-${{ runner.os }}-${{ hashFiles('infra/live/prod/.terraform.lock.hcl') }}
+          restore-keys: |
+            terraform-${{ runner.os }}-
+
+      # ========================================
+      # AWS Authentication (OIDC)
+      # ========================================
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+          role-session-name: GitHubActions-Terraform-${{ github.run_id }}
+
+      - name: Verify AWS authentication
+        run: |
+          echo "Verifying AWS authentication..."
+          aws sts get-caller-identity
+          echo "AWS authentication successful"
+
+      # ========================================
+      # Terraform Format Check
+      # ========================================
+      - name: Terraform Format Check
+        id: fmt
+        run: terraform fmt -check -recursive
+        continue-on-error: true
+
+      - name: Format Check Result
+        if: steps.fmt.outcome == 'failure'
+        run: |
+          echo "::error::Terraform formatting check failed. Run 'terraform fmt -recursive' to fix formatting issues."
+
+      # ========================================
+      # Terraform Init
+      # ========================================
+      - name: Terraform Init
+        id: init
+        run: terraform -chdir=${{ env.TERRAFORM_DIR }} init
+
+      # ========================================
+      # Terraform Validate
+      # ========================================
+      - name: Terraform Validate
+        id: validate
+        run: terraform -chdir=${{ env.TERRAFORM_DIR }} validate -no-color
+
+      # ========================================
+      # Security Scan (tfsec)
+      # ========================================
+      # tfsec is a static analysis security scanner for Terraform code.
+      # It checks for:
+      #   - Misconfigurations that could lead to security vulnerabilities
+      #   - AWS, Azure, GCP best practices violations
+      #   - Sensitive data exposure (hardcoded secrets, open security groups)
+      #   - Encryption settings (S3, EBS, RDS encryption)
+      #   - Network security (overly permissive ingress/egress rules)
+      #   - IAM policy issues (overly permissive policies)
+      #   - Logging and monitoring gaps
+      #
+      # Severity levels: CRITICAL, HIGH, MEDIUM, LOW
+      # This step fails the workflow on HIGH or CRITICAL findings.
+      - name: Terraform Security Scan (tfsec)
+        id: tfsec
+        uses: aquasecurity/tfsec-action@v1.0.3
+        with:
+          working_directory: ${{ env.TERRAFORM_DIR }}
+          soft_fail: false
+          # Pass additional arguments to tfsec CLI
+          # --minimum-severity: Only report findings at HIGH or CRITICAL level
+          additional_args: --minimum-severity HIGH
+        continue-on-error: false
+
+      # ========================================
+      # Terraform Plan
+      # ========================================
+      - name: Terraform Plan
+        id: plan
+        run: |
+          terraform -chdir=${{ env.TERRAFORM_DIR }} plan \
+            -no-color \
+            -out=tfplan \
+            -detailed-exitcode 2>&1 | tee plan_output.txt
+        continue-on-error: true
+
+      - name: Read Plan Output
+        id: plan-output
+        if: always()
+        run: |
+          # Read the plan output and prepare it for the PR comment
+          PLAN_OUTPUT=$(cat plan_output.txt)
+
+          # Escape special characters for GitHub Actions
+          # Handle multi-line output using EOF delimiter
+          echo "plan<<EOF" >> $GITHUB_OUTPUT
+          echo "$PLAN_OUTPUT" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      # ========================================
+      # PR Comment with Plan Output
+      # ========================================
+      - name: Post Plan to PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+
+            // Read plan output
+            let planOutput = '';
+            try {
+              planOutput = fs.readFileSync('plan_output.txt', 'utf8');
+            } catch (e) {
+              planOutput = 'Unable to read plan output';
+            }
+
+            // Truncate if too long (GitHub has a 65536 character limit for comments)
+            const maxLength = 60000;
+            if (planOutput.length > maxLength) {
+              planOutput = planOutput.substring(0, maxLength) + '\n\n... (output truncated)';
+            }
+
+            // Determine status emoji and message
+            const fmtOutcome = '${{ steps.fmt.outcome }}';
+            const initOutcome = '${{ steps.init.outcome }}';
+            const validateOutcome = '${{ steps.validate.outcome }}';
+            const tfsecOutcome = '${{ steps.tfsec.outcome }}';
+            const planOutcome = '${{ steps.plan.outcome }}';
+
+            let statusEmoji = '✅';
+            let statusMessage = 'All checks passed';
+
+            if (fmtOutcome === 'failure') {
+              statusEmoji = '⚠️';
+              statusMessage = 'Format check failed';
+            } else if (initOutcome === 'failure') {
+              statusEmoji = '❌';
+              statusMessage = 'Init failed';
+            } else if (validateOutcome === 'failure') {
+              statusEmoji = '❌';
+              statusMessage = 'Validation failed';
+            } else if (tfsecOutcome === 'failure') {
+              statusEmoji = '❌';
+              statusMessage = 'Security scan failed (HIGH/CRITICAL findings)';
+            } else if (planOutcome === 'failure') {
+              statusEmoji = '❌';
+              statusMessage = 'Plan failed';
+            }
+
+            const body = `## Terraform Plan ${statusEmoji}
+
+            **Status:** ${statusMessage}
+
+            | Step | Outcome |
+            |------|---------|
+            | Format | \`${fmtOutcome}\` |
+            | Init | \`${initOutcome}\` |
+            | Validate | \`${validateOutcome}\` |
+            | Security Scan | \`${tfsecOutcome}\` |
+            | Plan | \`${planOutcome}\` |
+
+            <details>
+            <summary>Show Plan Output</summary>
+
+            \`\`\`hcl
+            ${planOutput}
+            \`\`\`
+
+            </details>
+
+            ---
+            *Pusher: @${{ github.actor }}, Action: \`${{ github.event_name }}\`, Workflow: \`${{ github.workflow }}\`*
+            `;
+
+            // Find existing comment to update
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const botComment = comments.find(comment =>
+              comment.user.type === 'Bot' &&
+              comment.body.includes('## Terraform Plan')
+            );
+
+            if (botComment) {
+              // Update existing comment
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: botComment.id,
+                body: body
+              });
+            } else {
+              // Create new comment
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: body
+              });
+            }
+
+      # ========================================
+      # Check Plan Status
+      # ========================================
+      - name: Check Plan Status
+        if: steps.plan.outcome == 'failure'
+        run: |
+          echo "::error::Terraform plan failed. See the plan output above for details."
+          exit 1
+
+      # ========================================
+      # Terraform Apply (main branch only)
+      # ========================================
+      - name: Terraform Apply
+        id: apply
+        if: |
+          (github.ref == 'refs/heads/main' && github.event_name == 'push') ||
+          (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'apply')
+        run: |
+          echo "Applying Terraform changes..."
+          terraform -chdir=${{ env.TERRAFORM_DIR }} apply \
+            -auto-approve \
+            -no-color \
+            tfplan
+
+      # ========================================
+      # Summary
+      # ========================================
+      - name: Generate Summary
+        if: always()
+        run: |
+          echo "## Terraform Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Step | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Format Check | ${{ steps.fmt.outcome }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Init | ${{ steps.init.outcome }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Validate | ${{ steps.validate.outcome }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Security Scan | ${{ steps.tfsec.outcome }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Plan | ${{ steps.plan.outcome }} |" >> $GITHUB_STEP_SUMMARY
+
+          if [[ "${{ github.ref }}" == "refs/heads/main" && "${{ github.event_name }}" == "push" ]] || \
+             [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ github.event.inputs.action }}" == "apply" ]]; then
+            echo "| Apply | ${{ steps.apply.outcome }} |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| Apply | skipped (PR only) |" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Triggered by:** @${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Event:** ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Ref:** ${{ github.ref }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Commit:** ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+
+      # ========================================
+      # Fail if Format Check Failed
+      # ========================================
+      - name: Fail on Format Check
+        if: steps.fmt.outcome == 'failure'
+        run: |
+          echo "::error::Terraform formatting check failed."
+          echo "Run 'terraform fmt -recursive' locally and commit the changes."
+          exit 1

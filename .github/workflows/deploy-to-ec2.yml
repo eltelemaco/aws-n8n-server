@@ -1,0 +1,212 @@
+name: Deploy to EC2
+
+# This workflow deploys n8n stack updates to the EC2 instance via SSH.
+# It copies the deployment script and executes it remotely to update services
+# without recreating infrastructure.
+#
+# Required GitHub Secrets:
+#   - EC2_SSH_PRIVATE_KEY: SSH private key for EC2 access (must match the public key deployed via Terraform)
+#   - EC2_HOST: EC2 public IP address or domain name (e.g., 1.2.3.4 or ec2.example.com)
+#   - EC2_USER: SSH username for EC2 instance (typically 'ec2-user' for Amazon Linux 2023)
+#
+# Deployment Process:
+#   1. Copies deployment script to EC2 instance
+#   2. Executes script remotely to update docker-compose stack
+#   3. Monitors deployment progress via logs
+#   4. Reports success/failure status
+#
+# The deployment script performs:
+#   - Backup of current configuration
+#   - Graceful service shutdown
+#   - Service restart with new configuration
+#   - Health check verification
+#   - Automatic rollback on failure
+
+on:
+  # Manual trigger for on-demand deployments
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: 'Reason for deployment'
+        required: false
+        default: 'Manual deployment'
+        type: string
+
+  # Automatic trigger on push to main for relevant file changes
+  push:
+    branches:
+      - main
+    paths:
+      - 'infra/live/prod/user_data/docker-compose.yml.tftpl'
+      - 'infra/live/prod/user_data/traefik-static.yml.tftpl'
+      - 'infra/live/prod/user_data/systemd-service.tftpl'
+      - 'scripts/update-stack.sh'
+      - '.github/workflows/deploy-to-ec2.yml'
+
+jobs:
+  deploy:
+    name: Deploy to EC2
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Verify deployment script exists
+        run: |
+          if [[ ! -f scripts/update-stack.sh ]]; then
+            echo "Error: Deployment script not found at scripts/update-stack.sh"
+            exit 1
+          fi
+          echo "Deployment script verified"
+
+      - name: Configure SSH
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+
+          # Add SSH private key
+          echo "${{ secrets.EC2_SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+
+          # Disable strict host key checking for new hosts (add to known_hosts on first connect)
+          cat >> ~/.ssh/config << EOF
+          Host ec2-deploy
+            HostName ${{ secrets.EC2_HOST }}
+            User ${{ secrets.EC2_USER }}
+            IdentityFile ~/.ssh/deploy_key
+            StrictHostKeyChecking accept-new
+            ServerAliveInterval 60
+            ServerAliveCountMax 10
+          EOF
+
+          chmod 600 ~/.ssh/config
+
+          echo "SSH configuration completed"
+
+      - name: Test SSH connectivity
+        run: |
+          echo "Testing SSH connection to EC2 instance..."
+          ssh ec2-deploy "echo 'SSH connection successful' && whoami && hostname"
+
+      - name: Copy deployment script to EC2
+        run: |
+          echo "Copying deployment script to EC2 instance..."
+          scp scripts/update-stack.sh ec2-deploy:/tmp/update-stack.sh
+
+          # Move script to deployment directory and set executable permissions
+          ssh ec2-deploy "sudo mv /tmp/update-stack.sh /opt/stacks/n8n/update-stack.sh"
+          ssh ec2-deploy "sudo chmod +x /opt/stacks/n8n/update-stack.sh"
+
+          echo "Deployment script copied successfully"
+
+      - name: Copy updated configuration files
+        run: |
+          echo "Copying updated docker-compose template to EC2..."
+
+          # Create temporary directory for rendered templates
+          mkdir -p /tmp/deploy-configs
+
+          # Copy docker-compose template (will be rendered on EC2 with existing .env)
+          scp infra/live/prod/user_data/docker-compose.yml.tftpl ec2-deploy:/tmp/docker-compose.yml.tftpl
+
+          # Render docker-compose.yml on EC2 using existing environment variables
+          ssh ec2-deploy << 'EOF'
+            set -euo pipefail
+
+            # Source environment variables from .env file
+            if [[ -f /opt/stacks/n8n/.env ]]; then
+              set -a
+              source /opt/stacks/n8n/.env
+              set +a
+            else
+              echo "Warning: .env file not found, using defaults"
+            fi
+
+            # Render docker-compose template
+            envsubst < /tmp/docker-compose.yml.tftpl > /tmp/docker-compose.yml
+
+            # Move rendered file to deployment directory (preserve ownership)
+            sudo mv /tmp/docker-compose.yml /opt/stacks/n8n/docker-compose.yml
+            sudo chown root:root /opt/stacks/n8n/docker-compose.yml
+            sudo chmod 644 /opt/stacks/n8n/docker-compose.yml
+
+            # Cleanup template
+            rm -f /tmp/docker-compose.yml.tftpl
+
+            echo "docker-compose.yml updated successfully"
+          EOF
+
+      - name: Execute deployment script
+        id: deploy
+        run: |
+          echo "Starting deployment on EC2 instance..."
+          echo "Deployment reason: ${{ github.event.inputs.reason || 'Automatic deployment from push to main' }}"
+          echo "Triggered by: ${{ github.actor }}"
+          echo "Commit: ${{ github.sha }}"
+          echo "----------------------------------------"
+
+          # Execute deployment script and capture output
+          ssh ec2-deploy "sudo /opt/stacks/n8n/update-stack.sh" || exit_code=$?
+
+          if [[ ${exit_code:-0} -eq 0 ]]; then
+            echo "Deployment completed successfully"
+            echo "deployment_status=success" >> $GITHUB_OUTPUT
+          else
+            echo "Deployment failed with exit code: ${exit_code}"
+            echo "deployment_status=failed" >> $GITHUB_OUTPUT
+            exit ${exit_code}
+          fi
+
+      - name: Verify deployment
+        if: steps.deploy.outputs.deployment_status == 'success'
+        run: |
+          echo "Verifying deployment..."
+
+          # Check running containers
+          ssh ec2-deploy "cd /opt/stacks/n8n && sudo docker compose ps --format json" | jq -r '.[] | "\(.Service): \(.State) (\(.Status))"'
+
+          # Check deployment logs
+          echo "----------------------------------------"
+          echo "Recent deployment logs:"
+          ssh ec2-deploy "sudo tail -n 50 /var/log/n8n-deployment.log" || echo "No deployment logs available yet"
+
+      - name: Fetch deployment logs on failure
+        if: failure()
+        run: |
+          echo "========================================="
+          echo "Deployment failed - fetching logs for debugging"
+          echo "========================================="
+
+          echo "--- Deployment logs ---"
+          ssh ec2-deploy "sudo tail -n 100 /var/log/n8n-deployment.log" || echo "No deployment logs available"
+
+          echo ""
+          echo "--- Docker service status ---"
+          ssh ec2-deploy "cd /opt/stacks/n8n && sudo docker compose ps" || echo "Cannot retrieve container status"
+
+          echo ""
+          echo "--- Recent docker logs ---"
+          ssh ec2-deploy "cd /opt/stacks/n8n && sudo docker compose logs --tail=50" || echo "Cannot retrieve docker logs"
+
+      - name: Cleanup SSH keys
+        if: always()
+        run: |
+          rm -f ~/.ssh/deploy_key
+          rm -f ~/.ssh/config
+          echo "SSH keys cleaned up"
+
+      - name: Report deployment status
+        if: always()
+        run: |
+          if [[ "${{ steps.deploy.outputs.deployment_status }}" == "success" ]]; then
+            echo "✅ Deployment completed successfully"
+            echo "Deployed by: ${{ github.actor }}"
+            echo "Commit: ${{ github.sha }}"
+            echo "Reason: ${{ github.event.inputs.reason || 'Automatic deployment from push to main' }}"
+          else
+            echo "❌ Deployment failed"
+            echo "Check logs above for details"
+            exit 1
+          fi
